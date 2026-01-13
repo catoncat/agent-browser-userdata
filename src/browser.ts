@@ -13,8 +13,10 @@ import {
   type Locator,
   type CDPSession,
 } from 'playwright-core';
+import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import { stealthScripts } from './stealth.js';
 import type { LaunchCommand } from './types.js';
 import { type RefMap, type EnhancedSnapshot, getEnhancedSnapshot, parseRef } from './snapshot.js';
 
@@ -67,7 +69,7 @@ interface PageError {
 export class BrowserManager {
   private browser: Browser | null = null;
   private cdpPort: number | null = null;
-  private isPersistentContext: boolean = false;
+  private persistentContext: BrowserContext | null = null;
   private contexts: BrowserContext[] = [];
   private pages: Page[] = [];
   private activePageIndex: number = 0;
@@ -93,7 +95,31 @@ export class BrowserManager {
    * Check if browser is launched
    */
   isLaunched(): boolean {
-    return this.browser !== null || this.isPersistentContext;
+    return this.browser !== null || this.persistentContext !== null;
+  }
+
+  /**
+   * Get the default userDataDir path
+   */
+  private getDefaultUserDataDir(): string {
+    const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    const session = process.env.AGENT_BROWSER_SESSION || 'default';
+    const safeSession = session.replace(/[^a-zA-Z0-9._-]+/g, '_');
+    const dirName = safeSession === 'default' ? 'agent-browser' : `agent-browser-${safeSession}`;
+    return path.join(home, 'tmp', dirName);
+  }
+
+  /**
+   * Ensure directory exists (mkdir -p equivalent)
+   */
+  private async ensureDirectoryExists(dir: string): Promise<void> {
+    await fs.mkdir(dir, { recursive: true });
+  }
+
+  private async applyStealthScripts(context: BrowserContext): Promise<void> {
+    for (const script of stealthScripts) {
+      await context.addInitScript(script);
+    }
   }
 
   /**
@@ -666,39 +692,77 @@ export class BrowserManager {
       throw new Error('Extensions are only supported in Chromium');
     }
 
-    const launcher =
-      browserType === 'firefox' ? firefox : browserType === 'webkit' ? webkit : chromium;
-    const viewport = options.viewport ?? { width: 1280, height: 720 };
+    const userDataDir = options.userDataDir ?? this.getDefaultUserDataDir();
+    await this.ensureDirectoryExists(userDataDir);
 
-    let context: BrowserContext;
-    if (hasExtensions) {
-      const extPaths = options.extensions!.join(',');
-      const session = process.env.AGENT_BROWSER_SESSION || 'default';
-      context = await launcher.launchPersistentContext(
-        path.join(os.tmpdir(), `agent-browser-ext-${session}`),
-        {
-          headless: false,
-          executablePath: options.executablePath,
-          args: [`--disable-extensions-except=${extPaths}`, `--load-extension=${extPaths}`],
-          viewport,
-          extraHTTPHeaders: options.headers,
+    if (browserType === 'chromium') {
+      let executablePath = options.executablePath;
+
+      // Fix for macOS: Playwright's 'chrome' channel often launches "Chrome for Testing".
+      // If the user requests 'chrome' on macOS and doesn't specify an executable path,
+      // we attempt to resolve the system Chrome path to ensure the authentic Google Chrome is used.
+      if (os.platform() === 'darwin' && options.channel === 'chrome' && !executablePath) {
+        const systemChromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+        try {
+          await fs.access(systemChromePath);
+          executablePath = systemChromePath;
+        } catch {
+          // Fallback to Playwright's default behavior if system Chrome is not found
         }
-      );
-      this.isPersistentContext = true;
-    } else {
-      this.browser = await launcher.launch({
-        headless: options.headless ?? true,
-        executablePath: options.executablePath,
+      }
+
+      const args = ['--disable-blink-features=AutomationControlled'];
+      if (hasExtensions) {
+        const extPaths = options.extensions!.join(',');
+        args.push(`--disable-extensions-except=${extPaths}`, `--load-extension=${extPaths}`);
+      }
+
+      // Launch persistent context for automatic state persistence.
+      // Note: When executablePath is set, don't pass channel to avoid Playwright prioritizing channel.
+      const context = await chromium.launchPersistentContext(userDataDir, {
+        headless: hasExtensions ? false : (options.headless ?? true),
+        executablePath,
+        channel: executablePath ? undefined : options.channel,
+        viewport: options.viewport ?? { width: 1280, height: 720 },
+        extraHTTPHeaders: options.headers,
+        // Hide "Chrome is being controlled by automated test software" infobar
+        ignoreDefaultArgs: ['--enable-automation'],
+        args,
       });
+
+      await this.applyStealthScripts(context);
+      context.setDefaultTimeout(10000);
+
+      this.persistentContext = context;
+      this.browser = context.browser();
       this.cdpPort = null;
-      context = await this.browser.newContext({ viewport, extraHTTPHeaders: options.headers });
+      this.contexts = [context];
+
+      const page = context.pages()[0] ?? (await context.newPage());
+      this.pages = [page];
+      this.activePageIndex = 0;
+      this.setupPageTracking(page);
+      return;
     }
 
+    const launcher = browserType === 'firefox' ? firefox : webkit;
+    const context = await launcher.launchPersistentContext(userDataDir, {
+      headless: options.headless ?? true,
+      executablePath: options.executablePath,
+      viewport: options.viewport ?? { width: 1280, height: 720 },
+      extraHTTPHeaders: options.headers,
+    });
+
+    await this.applyStealthScripts(context);
     context.setDefaultTimeout(10000);
-    this.contexts.push(context);
+
+    this.persistentContext = context;
+    this.browser = context.browser();
+    this.cdpPort = null;
+    this.contexts = [context];
 
     const page = context.pages()[0] ?? (await context.newPage());
-    this.pages.push(page);
+    this.pages = [page];
     this.activePageIndex = 0;
     this.setupPageTracking(page);
   }
@@ -828,6 +892,7 @@ export class BrowserManager {
     const context = await this.browser.newContext({
       viewport: viewport ?? { width: 1280, height: 720 },
     });
+    await this.applyStealthScripts(context);
     context.setDefaultTimeout(10000);
     this.contexts.push(context);
 
@@ -1140,8 +1205,8 @@ export class BrowserManager {
 
     this.pages = [];
     this.contexts = [];
+    this.persistentContext = null;
     this.cdpPort = null;
-    this.isPersistentContext = false;
     this.activePageIndex = 0;
     this.refMap = {};
     this.lastSnapshot = '';

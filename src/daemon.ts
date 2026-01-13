@@ -203,6 +203,7 @@ export async function startDaemon(options?: { streamPort?: number }): Promise<vo
               headless: true,
               executablePath: process.env.AGENT_BROWSER_EXECUTABLE_PATH,
               extensions: extensions,
+              channel: process.env.AGENT_BROWSER_CHANNEL,
             });
           }
 
