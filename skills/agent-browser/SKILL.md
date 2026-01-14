@@ -103,7 +103,10 @@ agent-browser snapshot -i  # Check result
 
 ## Persistent State (automatic)
 
-Browser state (cookies, localStorage) is automatically persisted to `~/tmp/agent-browser/`. No need to manually save/load state for authentication:
+Browser state (cookies, localStorage) is automatically persisted to:
+
+- Default session: `~/tmp/agent-browser/`
+- Named sessions (`--session <name>`): `~/tmp/agent-browser-<name>/`
 
 ```bash
 # Login once - state is automatically saved
@@ -119,9 +122,23 @@ agent-browser close
 agent-browser open https://app.example.com/dashboard  # Already logged in!
 ```
 
+## System Chrome (`--channel`)
+
+Some sites (notably Google login) block Playwright's bundled "Chrome for Testing". Use your system Chrome instead:
+
+```bash
+agent-browser --channel chrome --headed open https://accounts.google.com
+```
+
+Note: `--channel` only affects browser launch. If a daemon is already running, close it first:
+
+```bash
+agent-browser close
+```
+
 ## Sessions
 
-Note: All sessions share the same userDataDir (`~/tmp/agent-browser/`), so parallel sessions may cause file locking issues. Use one session at a time for best results.
+Sessions isolate the daemon socket and (by default) the browser profile directory. Use a unique session name when you need isolation:
 
 ```bash
 agent-browser --session mytest open site.com  # Named session
